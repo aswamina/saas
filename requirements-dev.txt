@@ -1,0 +1,2 @@
+# Local development only (not installed on Vercel)
+python-dotenv
