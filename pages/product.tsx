@@ -8,7 +8,13 @@ import { fetchEventSource } from '@microsoft/fetch-event-source';
 type SavedIdea = {
     id: string;
     content: string;
+    category: string | null;
     created_at: string;
+};
+
+type Category = {
+    category_id: number;
+    name: string;
 };
 
 // Uses the idea's first Markdown heading (or first line) as its title in the list.
@@ -111,6 +117,11 @@ function IdeaHistory({
                                     <span className="block font-medium text-gray-800 dark:text-gray-200 line-clamp-2">
                                         {ideaTitle(saved.content)}
                                     </span>
+                                    {saved.category && (
+                                        <span className="inline-block mt-1 px-2 py-0.5 rounded-full text-xs bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">
+                                            {saved.category}
+                                        </span>
+                                    )}
                                     <span className="block text-xs text-gray-500 dark:text-gray-400 mt-1">
                                         {new Date(saved.created_at).toLocaleString()}
                                     </span>
@@ -149,15 +160,19 @@ function IdeaHistory({
 // The idea generator itself. Only rendered for users on the premium plan.
 function IdeaGenerator() {
     const { getToken } = useAuth();
-    const [idea, setIdea] = useState<string>('...loading');
-    // Starts as true because the first idea is requested as soon as the page loads.
-    const [isGenerating, setIsGenerating] = useState<boolean>(true);
+    const [idea, setIdea] = useState<string>('');
+    // Nothing is generated until the user clicks "Generate new idea".
+    const [isGenerating, setIsGenerating] = useState<boolean>(false);
     const controllerRef = useRef<AbortController | null>(null);
     // Bumped each time an idea finishes streaming (and has been saved), so the
     // "Your ideas" list reloads.
     const [historyVersion, setHistoryVersion] = useState<number>(0);
     // A saved idea picked from the sidebar; shown in the main card instead of the latest one.
     const [viewing, setViewing] = useState<SavedIdea | null>(null);
+    // Categories for the dropdown (loaded from Supabase via /api/categories).
+    // '' means "Any category".
+    const [categories, setCategories] = useState<Category[]>([]);
+    const [categoryId, setCategoryId] = useState<string>('');
 
     // Keep the latest getToken in a ref so a new Clerk function identity
     // doesn't restart the stream.
@@ -166,10 +181,8 @@ function IdeaGenerator() {
         getTokenRef.current = getToken;
     }, [getToken]);
 
-    // Opens the authenticated stream from /api. State only changes after an
-    // await or inside the stream's callbacks, so this is safe to call from the
-    // effect below.
-    const startStream = useCallback(async () => {
+    // Opens the authenticated stream from /api.
+    const startStream = useCallback(async (selectedCategoryId?: string) => {
         // Stop any stream that is still running before starting a new one.
         controllerRef.current?.abort();
         const controller = new AbortController();
@@ -184,7 +197,10 @@ function IdeaGenerator() {
                 return;
             }
 
-            await fetchEventSource('/api', {
+            const url = selectedCategoryId
+                ? `/api?category_id=${encodeURIComponent(selectedCategoryId)}`
+                : '/api';
+            await fetchEventSource(url, {
                 headers: { Authorization: `Bearer ${jwt}` },
                 signal: controller.signal,
                 // By default the library closes the stream when the tab is hidden
@@ -216,19 +232,36 @@ function IdeaGenerator() {
         }
     }, []);
 
+    // Stop any stream that's still running if the user leaves the page.
     useEffect(() => {
-        // startStream only sets state after `await getToken()`, never synchronously,
-        // but the lint rule can't see through the async function.
-        // eslint-disable-next-line react-hooks/set-state-in-effect
-        startStream();
         return () => { controllerRef.current?.abort(); };
-    }, [startStream]);
+    }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const jwt = await getTokenRef.current();
+                if (!jwt) return;
+                const res = await fetch('/api/categories', {
+                    headers: { Authorization: `Bearer ${jwt}` },
+                });
+                if (!res.ok) throw new Error(`Request failed (${res.status})`);
+                const data = (await res.json()) as Category[];
+                if (!cancelled) setCategories(data);
+            } catch (err) {
+                // The generator still works without categories ("Any category").
+                console.error('Failed to load categories:', err);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, []);
 
     const generateIdea = () => {
         setViewing(null);
         setIdea('');
         setIsGenerating(true);
-        startStream();
+        startStream(categoryId);
     };
 
     const shown = viewing ? viewing.content : idea;
@@ -250,7 +283,48 @@ function IdeaGenerator() {
             <div className="max-w-6xl mx-auto grid gap-8 lg:grid-cols-[minmax(0,1fr)_20rem] items-start">
                 {/* Content Card */}
                 <div>
-                    <div className="flex justify-center mb-6">
+                    <div className="flex flex-col sm:flex-row items-center justify-center gap-3 mb-6">
+                        <div className="relative w-full sm:w-72">
+                            <label htmlFor="category" className="sr-only">Category</label>
+                            {/* Tag icon on the left */}
+                            <svg
+                                aria-hidden="true"
+                                viewBox="0 0 20 20"
+                                fill="currentColor"
+                                className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 h-4 w-4 text-indigo-500 dark:text-indigo-400"
+                            >
+                                <path fillRule="evenodd" d="M5.5 3A2.5 2.5 0 0 0 3 5.5v2.879a2.5 2.5 0 0 0 .732 1.767l6.5 6.5a2.5 2.5 0 0 0 3.536 0l2.878-2.878a2.5 2.5 0 0 0 0-3.536l-6.5-6.5A2.5 2.5 0 0 0 8.38 3H5.5ZM6 7a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clipRule="evenodd" />
+                            </svg>
+                            <select
+                                id="category"
+                                value={categoryId}
+                                onChange={(e) => setCategoryId(e.target.value)}
+                                disabled={isGenerating}
+                                className="w-full appearance-none cursor-pointer truncate rounded-full border border-indigo-200 bg-white/90 py-3 pl-11 pr-11 text-sm font-medium text-gray-800 shadow-lg backdrop-blur transition hover:border-indigo-400 focus:border-indigo-500 focus:outline-none focus:ring-4 focus:ring-indigo-500/20 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800/90 dark:text-gray-100 dark:hover:border-indigo-400"
+                            >
+                                <option value="" className="bg-white text-gray-800 dark:bg-gray-800 dark:text-gray-100">
+                                    Any category
+                                </option>
+                                {categories.map((c) => (
+                                    <option
+                                        key={c.category_id}
+                                        value={String(c.category_id)}
+                                        className="bg-white text-gray-800 dark:bg-gray-800 dark:text-gray-100"
+                                    >
+                                        {c.name}
+                                    </option>
+                                ))}
+                            </select>
+                            {/* Chevron on the right (replaces the browser's default arrow) */}
+                            <svg
+                                aria-hidden="true"
+                                viewBox="0 0 20 20"
+                                fill="currentColor"
+                                className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 h-5 w-5 text-gray-400"
+                            >
+                                <path fillRule="evenodd" d="M5.22 8.22a.75.75 0 0 1 1.06 0L10 11.94l3.72-3.72a.75.75 0 1 1 1.06 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L5.22 9.28a.75.75 0 0 1 0-1.06Z" clipRule="evenodd" />
+                            </svg>
+                        </div>
                         <button
                             type="button"
                             onClick={generateIdea}
@@ -265,7 +339,7 @@ function IdeaGenerator() {
                         {viewing && (
                             <div className="flex items-center justify-between gap-4 mb-4 pb-4 border-b border-gray-200 dark:border-gray-700 text-sm">
                                 <span className="text-gray-500 dark:text-gray-400">
-                                    Saved idea from {new Date(viewing.created_at).toLocaleString()}
+                                    Saved idea{viewing.category ? ` · ${viewing.category}` : ''} · {new Date(viewing.created_at).toLocaleString()}
                                 </span>
                                 <button
                                     type="button"
@@ -276,11 +350,41 @@ function IdeaGenerator() {
                                 </button>
                             </div>
                         )}
-                        {shown === '' ? (
+                        {shown === '' && isGenerating ? (
                             <div className="flex items-center justify-center py-12">
                                 <div className="animate-pulse text-gray-400">
-                                    {isGenerating ? 'Generating your business idea...' : 'No idea yet. Try generating one.'}
+                                    Generating your business idea...
                                 </div>
+                            </div>
+                        ) : shown === '' ? (
+                            // First visit (or nothing generated yet): explain how to get started.
+                            <div className="py-6 text-center">
+                                <h2 className="text-2xl font-bold text-gray-800 dark:text-gray-100 mb-2">
+                                    Ready for your next big idea?
+                                </h2>
+                                <p className="text-gray-600 dark:text-gray-400 mb-8">
+                                    Get an AI-generated business idea for AI agents in a few seconds.
+                                </p>
+                                <ol className="mx-auto max-w-md space-y-4 text-left">
+                                    <li className="flex gap-4">
+                                        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-100 font-semibold text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">1</span>
+                                        <span className="text-gray-700 dark:text-gray-300">
+                                            <strong>Choose a category</strong> from the dropdown above to get an idea tailored to that industry, or leave it on <strong>Any category</strong> for a broader idea.
+                                        </span>
+                                    </li>
+                                    <li className="flex gap-4">
+                                        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-100 font-semibold text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">2</span>
+                                        <span className="text-gray-700 dark:text-gray-300">
+                                            Click <strong>Generate new idea</strong> and watch it appear here.
+                                        </span>
+                                    </li>
+                                    <li className="flex gap-4">
+                                        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-100 font-semibold text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">3</span>
+                                        <span className="text-gray-700 dark:text-gray-300">
+                                            Every idea is saved to <strong>Your ideas</strong>, so you can come back to it any time.
+                                        </span>
+                                    </li>
+                                </ol>
                             </div>
                         ) : (
                             <div className="markdown-content text-gray-700 dark:text-gray-300">

@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+from typing import Optional
 
 import httpx  # type: ignore
 from fastapi import Depends, FastAPI, HTTPException, Query  # type: ignore
@@ -32,6 +33,7 @@ clerk_guard = ClerkHTTPBearer(clerk_config)
 
 MODEL = "gpt-5-nano"
 IDEAS_TABLE = "ideas"
+CATEGORIES_TABLE = "categories"
 
 # Must match the plan key in Clerk Billing and the plan checked in pages/product.tsx.
 REQUIRED_PLAN = "premium_subscription"
@@ -51,13 +53,13 @@ def has_plan(claims: dict, plan: str) -> bool:
     return False
 
 
-def supabase_settings() -> "tuple[str, str] | None":
-    """Return (rest_url_for_ideas, secret_key), or None if Supabase isn't configured."""
+def supabase_settings(table: str = IDEAS_TABLE) -> Optional[tuple]:
+    """Return (rest_url_for_table, secret_key), or None if Supabase isn't configured."""
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SECRET_KEY")
     if not url or not key:
         return None
-    return f"{url.rstrip('/')}/rest/v1/{IDEAS_TABLE}", key
+    return f"{url.rstrip('/')}/rest/v1/{table}", key
 
 
 def supabase_headers(key: str) -> dict:
@@ -69,7 +71,27 @@ def supabase_headers(key: str) -> dict:
     return headers
 
 
-def save_idea(text: str, user_id: str) -> None:
+def fetch_categories(category_id: Optional[int] = None) -> list:
+    """Load categories from Supabase (all of them, or just one by id), ordered for display."""
+    settings = supabase_settings(CATEGORIES_TABLE)
+    if not settings:
+        raise HTTPException(status_code=500, detail="Category storage is not configured")
+    endpoint, key = settings
+    params = {"select": "category_id,name", "order": "sort_order.asc,name.asc"}
+    if category_id is not None:
+        params["category_id"] = f"eq.{category_id}"
+    try:
+        response = httpx.get(endpoint, headers=supabase_headers(key), params=params, timeout=10)
+    except httpx.HTTPError as exc:
+        print(f"Failed to load categories from Supabase: {exc}")
+        raise HTTPException(status_code=502, detail="Could not load categories")
+    if response.status_code >= 300:
+        print(f"Failed to load categories from Supabase ({response.status_code}): {response.text}")
+        raise HTTPException(status_code=502, detail="Could not load categories")
+    return response.json()
+
+
+def save_idea(text: str, user_id: str, category: Optional[str] = None) -> None:
     """Insert a finished idea, and the Clerk user who generated it, into the
     Supabase `ideas` table.
 
@@ -89,7 +111,7 @@ def save_idea(text: str, user_id: str) -> None:
         response = httpx.post(
             endpoint,
             headers={**supabase_headers(key), "Prefer": "return=minimal"},
-            json={"content": text, "model": MODEL, "user_id": user_id},
+            json={"content": text, "model": MODEL, "user_id": user_id, "category": category},
             timeout=10,
         )
         if response.status_code >= 300:
@@ -99,7 +121,10 @@ def save_idea(text: str, user_id: str) -> None:
 
 
 @app.get("/api")
-def idea(creds: HTTPAuthorizationCredentials = Depends(clerk_guard)):
+def idea(
+    category_id: Optional[int] = Query(None),
+    creds: HTTPAuthorizationCredentials = Depends(clerk_guard),
+):
     user_id = creds.decoded["sub"]  # User ID from JWT - available for future use
     # We now know which user is making the request! 
     # You could use user_id to:
@@ -112,8 +137,18 @@ def idea(creds: HTTPAuthorizationCredentials = Depends(clerk_guard)):
     if not has_plan(creds.decoded, REQUIRED_PLAN):
         raise HTTPException(status_code=403, detail="A premium subscription is required")
 
+    # Look the category up by id rather than taking its name from the browser, so
+    # only categories in the Supabase table can ever end up in the prompt.
+    category = None
+    if category_id is not None:
+        rows = fetch_categories(category_id)
+        if not rows:
+            raise HTTPException(status_code=400, detail="Unknown category")
+        category = rows[0]["name"]
+
+    focus = f" tailored to the {category} industry" if category else ""
     client = OpenAI()
-    prompt = [{"role": "user", "content": "Reply with a new business idea for AI Agents, formatted with headings, sub-headings and bullet points"}]
+    prompt = [{"role": "user", "content": f"Reply with a new business idea for AI Agents{focus}, formatted with headings, sub-headings and bullet points"}]
     stream = client.chat.completions.create(model=MODEL, messages=prompt, stream=True)
 
     def event_stream():
@@ -128,7 +163,7 @@ def idea(creds: HTTPAuthorizationCredentials = Depends(clerk_guard)):
                 # the blank lines and line breaks Markdown needs.
                 yield f"data: {json.dumps(text)}\n\n"
         # The whole idea has been sent; store it before closing the stream.
-        save_idea("".join(full_text), user_id)
+        save_idea("".join(full_text), user_id, category)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -160,7 +195,7 @@ def list_ideas(
             # count=exact makes Supabase report the total in the Content-Range header.
             headers={**supabase_headers(key), "Prefer": "count=exact"},
             params={
-                "select": "id,content,created_at",
+                "select": "id,content,category,created_at",
                 "user_id": f"eq.{user_id}",
                 "order": "created_at.desc",
                 "limit": str(IDEAS_PAGE_SIZE),
@@ -181,3 +216,9 @@ def list_ideas(
     total_part = response.headers.get("content-range", "").rpartition("/")[2]
     total = int(total_part) if total_part.isdigit() else len(ideas)
     return {"ideas": ideas, "total": total, "page": page, "page_size": IDEAS_PAGE_SIZE}
+
+
+@app.get("/api/categories")
+def list_categories(creds: HTTPAuthorizationCredentials = Depends(clerk_guard)):
+    """Return the categories for the dropdown: [{"category_id": 1, "name": "..."}, ...]."""
+    return fetch_categories()

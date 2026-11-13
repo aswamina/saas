@@ -1,3 +1,6 @@
 {
-  "rewrites": [{ "source": "/api/ideas", "destination": "/api" }]
+  "rewrites": [
+    { "source": "/api/ideas", "destination": "/api" },
+    { "source": "/api/categories", "destination": "/api" }
+  ]
 }

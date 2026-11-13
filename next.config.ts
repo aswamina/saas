@@ -20,6 +20,7 @@ const nextConfig: NextConfig = {
     return [
       { source: "/api", destination: "http://127.0.0.1:8000/api" },
       { source: "/api/ideas", destination: "http://127.0.0.1:8000/api/ideas" },
+      { source: "/api/categories", destination: "http://127.0.0.1:8000/api/categories" },
     ];
   },
 };
