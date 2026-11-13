@@ -17,7 +17,10 @@ const nextConfig: NextConfig = {
   // "production" and the Python function serves /api as before.
   async rewrites() {
     if (process.env.NODE_ENV !== "development") return [];
-    return [{ source: "/api", destination: "http://127.0.0.1:8000/api" }];
+    return [
+      { source: "/api", destination: "http://127.0.0.1:8000/api" },
+      { source: "/api/ideas", destination: "http://127.0.0.1:8000/api/ideas" },
+    ];
   },
 };
 

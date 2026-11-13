@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 import httpx  # type: ignore
-from fastapi import Depends, FastAPI, HTTPException  # type: ignore
+from fastapi import Depends, FastAPI, HTTPException, Query  # type: ignore
 from fastapi.responses import StreamingResponse  # type: ignore
 from fastapi_clerk_auth import ClerkConfig, ClerkHTTPBearer, HTTPAuthorizationCredentials  # type: ignore
 from openai import OpenAI  # type: ignore
@@ -51,6 +51,24 @@ def has_plan(claims: dict, plan: str) -> bool:
     return False
 
 
+def supabase_settings() -> "tuple[str, str] | None":
+    """Return (rest_url_for_ideas, secret_key), or None if Supabase isn't configured."""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SECRET_KEY")
+    if not url or not key:
+        return None
+    return f"{url.rstrip('/')}/rest/v1/{IDEAS_TABLE}", key
+
+
+def supabase_headers(key: str) -> dict:
+    headers = {"apikey": key, "Content-Type": "application/json"}
+    # Legacy service_role keys are JWTs and also go in the Authorization header.
+    # New sb_secret_ keys are sent in the apikey header only.
+    if key.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
 def save_idea(text: str, user_id: str) -> None:
     """Insert a finished idea, and the Clerk user who generated it, into the
     Supabase `ideas` table.
@@ -61,26 +79,16 @@ def save_idea(text: str, user_id: str) -> None:
     """
     if not text.strip():
         return
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SECRET_KEY")
-    if not url or not key:
+    settings = supabase_settings()
+    if not settings:
         print("SUPABASE_URL / SUPABASE_SECRET_KEY not set; skipping save")
         return
-
-    headers = {
-        "apikey": key,
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-    }
-    # Legacy service_role keys are JWTs and also go in the Authorization header.
-    # New sb_secret_ keys are sent in the apikey header only.
-    if key.startswith("eyJ"):
-        headers["Authorization"] = f"Bearer {key}"
+    endpoint, key = settings
 
     try:
         response = httpx.post(
-            f"{url.rstrip('/')}/rest/v1/{IDEAS_TABLE}",
-            headers=headers,
+            endpoint,
+            headers={**supabase_headers(key), "Prefer": "return=minimal"},
             json={"content": text, "model": MODEL, "user_id": user_id},
             timeout=10,
         )
@@ -123,3 +131,53 @@ def idea(creds: HTTPAuthorizationCredentials = Depends(clerk_guard)):
         save_idea("".join(full_text), user_id)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+IDEAS_PAGE_SIZE = 10
+
+
+@app.get("/api/ideas")
+def list_ideas(
+    page: int = Query(1, ge=1),
+    creds: HTTPAuthorizationCredentials = Depends(clerk_guard),
+):
+    """Return one page (10 per page) of the signed-in user's saved ideas, newest first,
+    plus the total count so the page can show "Page x of y".
+
+    Only rows whose user_id matches the Clerk user in the verified token are
+    returned, so users can never see each other's ideas (and old rows with no
+    user_id are never shown).
+    """
+    user_id = creds.decoded["sub"]
+    settings = supabase_settings()
+    if not settings:
+        raise HTTPException(status_code=500, detail="Idea storage is not configured")
+    endpoint, key = settings
+
+    try:
+        response = httpx.get(
+            endpoint,
+            # count=exact makes Supabase report the total in the Content-Range header.
+            headers={**supabase_headers(key), "Prefer": "count=exact"},
+            params={
+                "select": "id,content,created_at",
+                "user_id": f"eq.{user_id}",
+                "order": "created_at.desc",
+                "limit": str(IDEAS_PAGE_SIZE),
+                "offset": str((page - 1) * IDEAS_PAGE_SIZE),
+            },
+            timeout=10,
+        )
+    except httpx.HTTPError as exc:
+        print(f"Failed to load ideas from Supabase: {exc}")
+        raise HTTPException(status_code=502, detail="Could not load your ideas")
+    # 416 means the page is past the end (e.g. after rows were deleted): return it empty.
+    if response.status_code >= 300 and response.status_code != 416:
+        print(f"Failed to load ideas from Supabase ({response.status_code}): {response.text}")
+        raise HTTPException(status_code=502, detail="Could not load your ideas")
+
+    # Content-Range looks like "0-9/42" (or "*/0" when empty); the part after "/" is the total.
+    ideas = response.json() if response.status_code != 416 else []
+    total_part = response.headers.get("content-range", "").rpartition("/")[2]
+    total = int(total_part) if total_part.isdigit() else len(ideas)
+    return {"ideas": ideas, "total": total, "page": page, "page_size": IDEAS_PAGE_SIZE}
